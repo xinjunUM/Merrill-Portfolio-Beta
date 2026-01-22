@@ -1,162 +1,141 @@
 // ==UserScript==
-// @name         Merrill Portfolio Beta (via Stooq historical beta)
-// @namespace    https://example.com/
-// @version      0.1.0
-// @description  Estimates per-holding beta vs SPY using Stooq daily closes, then computes portfolio beta (weight * beta).
-// @match        https://*.merrilledge.com/*
-// @match        https://*.ml.com/*
+// @name         Merrill Portfolio Beta
+// @namespace    mailto:lixinjun@umich.edu
+// @version      0.2.0
+// @description  Aggregates holdings from multiple tables (Equities, MFs, Accounts), sums Market Values, and estimates Beta.
+// @match        https://*.ml.com/TFPHoldings/*
 // @grant        GM_xmlhttpRequest
 // @connect      stooq.com
+// @connect      query1.finance.yahoo.com
 // @run-at       document-end
 // ==/UserScript==
 
 (() => {
     "use strict";
 
-    /***********************
-   * What this script does
-   * - Pulls daily close prices from Stooq CSV
-   * - Computes beta = Cov(r_asset, r_mkt) / Var(r_mkt)
-   * - Uses SPY as market proxy by default (spy.us)
-   * - Portfolio beta = Σ(weight_i * beta_i)
-   ***********************/
+    // --- Configuration ---
+    const DEFAULT_LOOKBACK_DAYS = 252;
+    const DEFAULT_MARKET_STOOQ = "spy.us";
+    const DEFAULT_MARKET_YAHOO = "SPY";
+    const CACHE_PREFIX = "mb_beta_cache_v2_";
+    const CACHE_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
 
-    const DEFAULT_LOOKBACK_DAYS = 252; // ~1 trading year
-    const DEFAULT_MARKET = "spy.us";   // market proxy
-    const STOOQ_DAILY_URL = (symbol) =>
-    `https://stooq.com/q/d/l/?s=${encodeURIComponent(symbol)}&i=d`;
+    // --- API URL Generators ---
+    const STOOQ_URL = (symbol) =>
+`https://stooq.com/q/d/l/?s=${encodeURIComponent(symbol)}&i=d`;
 
-    // --- Small helpers ---
-    function gmFetchText(url, timeoutMs = 20000) {
-        function formatAnyError(e) {
-            if (!e) return "Unknown error";
-            if (e instanceof Error) return e.message || String(e);
+    const YAHOO_URL = (symbol) =>
+`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=2y&interval=1d&events=history`;
 
-            // GM_xmlhttpRequest error objects are often plain objects
-            try {
-                return JSON.stringify(e, Object.getOwnPropertyNames(e), 2);
-            } catch {
-                return String(e);
+    // --- Caching ---
+    function getCachedBeta(source, symbol, market, lookback) {
+        const key = `${CACHE_PREFIX}${source}_${symbol}_${market}_${lookback}`;
+        try {
+            const raw = localStorage.getItem(key);
+            if (!raw) return null;
+            const data = JSON.parse(raw);
+            if (Date.now() - data.timestamp > CACHE_DURATION_MS) {
+                localStorage.removeItem(key);
+                return null;
             }
-        }
+            return data;
+        } catch (e) { return null; }
+    }
+
+    function setCachedBeta(source, symbol, market, lookback, beta, n) {
+        const key = `${CACHE_PREFIX}${source}_${symbol}_${market}_${lookback}`;
+        try {
+            localStorage.setItem(key, JSON.stringify({ beta, n, timestamp: Date.now() }));
+        } catch (e) { console.warn("Cache full", e); }
+    }
+
+    // --- Network ---
+    function gmFetch(url) {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
-                method: "GET",
-                url,
-                timeout: timeoutMs,
-
-                onload: (res) => {
-                    // res: {status, statusText, responseText, finalUrl, ...}
-                    if (res.status >= 200 && res.status < 300) {
-                        resolve(res.responseText);
-                        return;
-                    }
-
-                    // Build a meaningful error
-                    const bodyPreview = (res.responseText || "").slice(0, 200).replace(/\s+/g, " ").trim();
-                    reject(
-                        new Error(
-                            `HTTP ${res.status} ${res.statusText || ""} for ${url}` +
-                            (bodyPreview ? ` | Body: ${bodyPreview}` : "")
-                        )
-                    );
-                },
-
-                ontimeout: () => reject(new Error(`Timeout after ${timeoutMs}ms for ${url}`)),
-
-                onerror: (e) => reject(new Error(`Network/GM error for ${url}: ${formatAnyError(e)}`)),
+                method: "GET", url, timeout: 20000,
+                onload: (res) => (res.status >= 200 && res.status < 300) ? resolve(res.responseText) : reject(new Error(`HTTP ${res.status}`)),
+                ontimeout: () => reject(new Error("Timeout")),
+                onerror: () => reject(new Error("Network Error")),
             });
         });
     }
 
-
-    function parseStooqCsv(csvText) {
-        // Stooq format: Date,Open,High,Low,Close,Volume
-        // Example header: Date,Open,High,Low,Close,Volume
-        const lines = csvText.trim().split(/\r?\n/);
-        if (lines.length < 3) return [];
+    // --- Data Fetching ---
+    async function fetchPricesStooq(symbol) {
+        const txt = await gmFetch(STOOQ_URL(symbol));
+        const lines = txt.trim().split(/\r?\n/);
+        if (lines.length < 3) throw new Error("No data");
         const header = lines[0].split(",");
-        const dateIdx = header.findIndex((h) => h.toLowerCase() === "date");
-        const closeIdx = header.findIndex((h) => h.toLowerCase() === "close");
-        if (dateIdx === -1 || closeIdx === -1) return [];
-
+        const dateIdx = header.findIndex(h => h.toLowerCase() === "date");
+        const closeIdx = header.findIndex(h => h.toLowerCase() === "close");
         const rows = [];
         for (let i = 1; i < lines.length; i++) {
             const parts = lines[i].split(",");
-            const date = parts[dateIdx];
-            const close = Number(parts[closeIdx]);
-            if (!date || !Number.isFinite(close)) continue;
-            rows.push({ date, close });
+            if (parts[dateIdx] && !isNaN(parts[closeIdx])) rows.push({ date: parts[dateIdx], close: Number(parts[closeIdx]) });
         }
-        // Stooq returns ascending by date already, but ensure:
-        rows.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+        return rows.sort((a, b) => (a.date < b.date ? -1 : 1));
+    }
+
+    async function fetchPricesYahoo(symbol) {
+        const jsonTxt = await gmFetch(YAHOO_URL(symbol));
+        const data = JSON.parse(jsonTxt);
+        const result = data.chart?.result?.[0];
+        if (!result?.timestamp || !result?.indicators?.quote?.[0]) throw new Error("Invalid Yahoo JSON");
+        const timestamps = result.timestamp;
+        const adjClose = result.indicators.adjclose?.[0]?.adjclose || result.indicators.quote[0].close;
+        const rows = [];
+        for (let i = 0; i < timestamps.length; i++) {
+            if (timestamps[i] && Number.isFinite(adjClose[i])) {
+                rows.push({ date: new Date(timestamps[i] * 1000).toISOString().split("T")[0], close: adjClose[i] });
+            }
+        }
         return rows;
     }
 
-    function toReturns(priceRows) {
-        // simple daily returns r_t = close_t / close_{t-1} - 1
+    // --- Math ---
+    function toReturns(rows) {
         const rets = [];
-        for (let i = 1; i < priceRows.length; i++) {
-            const p0 = priceRows[i - 1].close;
-            const p1 = priceRows[i].close;
-            if (!Number.isFinite(p0) || !Number.isFinite(p1) || p0 <= 0) continue;
-            rets.push({ date: priceRows[i].date, r: p1 / p0 - 1 });
+        for (let i = 1; i < rows.length; i++) {
+            const p0 = rows[i - 1].close, p1 = rows[i].close;
+            if (p0 > 0 && p1 > 0) rets.push({ date: rows[i].date, r: p1 / p0 - 1 });
         }
         return rets;
     }
 
-    function alignReturns(assetRets, mktRets) {
-        // Align by date intersection
-        const mktMap = new Map(mktRets.map((x) => [x.date, x.r]));
-        const xs = [];
-        const ys = [];
-        for (const a of assetRets) {
+    function alignReturns(asset, mkt) {
+        const mktMap = new Map(mkt.map(x => [x.date, x.r]));
+        const xs = [], ys = [];
+        for (const a of asset) {
             const m = mktMap.get(a.date);
-            if (m === undefined) continue;
-            xs.push(a.r);
-            ys.push(m);
+            if (m !== undefined) { xs.push(a.r); ys.push(m); }
         }
         return { asset: xs, mkt: ys };
     }
 
-    function variance(arr) {
-        if (arr.length < 2) return NaN;
-        const mean = arr.reduce((s, x) => s + x, 0) / arr.length;
-        let v = 0;
-        for (const x of arr) v += (x - mean) * (x - mean);
-        return v / (arr.length - 1);
+    function calculateBeta(asset, mkt) {
+        const n = asset.length;
+        if (n < 20) return NaN;
+        const meanA = asset.reduce((a, b) => a + b, 0) / n;
+        const meanM = mkt.reduce((a, b) => a + b, 0) / n;
+        let cov = 0, varM = 0;
+        for (let i = 0; i < n; i++) {
+            cov += (asset[i] - meanA) * (mkt[i] - meanM);
+            varM += (mkt[i] - meanM) * (mkt[i] - meanM);
+        }
+        return varM === 0 ? NaN : cov / varM;
     }
 
-    function covariance(a, b) {
-        if (a.length !== b.length || a.length < 2) return NaN;
-        const meanA = a.reduce((s, x) => s + x, 0) / a.length;
-        const meanB = b.reduce((s, x) => s + x, 0) / b.length;
-        let c = 0;
-        for (let i = 0; i < a.length; i++) c += (a[i] - meanA) * (b[i] - meanB);
-        return c / (a.length - 1);
-    }
-
-    function betaFromReturns(assetR, mktR) {
-        const v = variance(mktR);
-        if (!Number.isFinite(v) || v === 0) return NaN;
-        const c = covariance(assetR, mktR);
-        return c / v;
-    }
-
-    function normalizeToStooqSymbol(rawTicker) {
-        // Convert common US tickers to stooq symbols:
-        // AAPL -> aapl.us
-        // BRK.B -> brk.b.us
-        // Remove whitespace, keep dot for class shares.
-        let t = (rawTicker || "").trim();
+    function normalizeTicker(raw, source) {
+        let t = (raw || "").trim().toUpperCase();
         if (!t) return "";
-        // If user already typed ".us" or another stooq suffix, keep it (lowercase it).
-        if (/\.[a-z]{2,}$/i.test(t)) return t.toLowerCase();
-        // If they typed something like "AAPL US" or "AAPL.US", normalize:
-        t = t.replace(/\s+/g, "");
-        // Convert AAPL.US -> aapl.us
-        if (t.includes(".")) return t.toLowerCase(); // already dotted (BRK.B)
-        return `${t.toLowerCase()}.us`;
+        if (source === "stooq") {
+            if (/\.[a-z]{2,}$/i.test(t)) return t.toLowerCase();
+            t = t.replace(/\s+/g, "");
+            return t.includes(".") ? t.toLowerCase() : `${t.toLowerCase()}.us`;
+        } else {
+            return t.replace(/\./g, "-");
+        }
     }
 
     function safeNum(x) {
@@ -164,74 +143,66 @@
         return Number.isFinite(n) ? n : NaN;
     }
 
-    function sleep(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
-    }
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
     // --- UI ---
     const panel = document.createElement("div");
+    // UPDATED: Use Flexbox (display: flex) and hidden overflow on the container
     panel.style.cssText = `
-  position: fixed;
-  right: 14px;
-  bottom: 14px;
-  width: 420px;
-  max-height: 70vh;
-  overflow: auto;
-  z-index: 999999;
-  background: #ffffff;
-  color: #111111;
-  border: 1px solid #cfcfcf;
-  border-radius: 10px;
-  box-shadow: 0 8px 24px rgba(0,0,0,0.18);
-  font: 12px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-  `;
+position: fixed; right: 20px; bottom: 20px; width: 460px;
+max-height: 80vh; z-index: 999999;
+background: #ffffff; color: #111111; border: 1px solid #cfcfcf;
+border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+font: 12px/1.35 system-ui, sans-serif;
+display: flex; flex-direction: column; /* Stacks header and content */
+overflow: hidden; /* Prevents double scrollbars */
+resize: both; /* Enables the resize handle in bottom-right corner */
+`;
 
     panel.innerHTML = `
-    <div style="padding:10px 12px; border-bottom:1px solid #333; display:flex; gap:8px; align-items:center;">
-      <div style="font-weight:700; font-size:13px; flex:1;">Portfolio Beta (Stooq)</div>
-      <button id="mb_close" style="cursor:pointer; background:#f7f7f7; color:#111111; border:1px solid #444; border-radius:8px; padding:4px 8px;">✕</button>
-    </div>
+<div id="mb_header" style="padding:10px 12px; border-bottom:1px solid #eee; display:flex; gap:8px; align-items:center; background:#f9f9f9; border-radius:10px 10px 0 0; cursor: move; user-select: none; flex: 0 0 auto;">
+  <div style="font-weight:700; font-size:13px; flex:1;">Merrill Portfolio Beta</div>
+  <button id="mb_close" style="cursor:pointer; background:transparent; border:none; font-size:16px; color:#555;">✕</button>
+</div>
 
-    <div style="padding:10px 12px; display:grid; gap:10px;">
-      <div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px;">
-        <label style="display:grid; gap:4px;">
-          <div style="opacity:.8;">Market proxy (Stooq symbol)</div>
-          <input id="mb_market" value="${DEFAULT_MARKET}" style="padding:6px 8px; border-radius:8px; border:1px solid #d0d0d0; background:#f7f7f7; color:#111111;">
-        </label>
-        <label style="display:grid; gap:4px;">
-          <div style="opacity:.8;">Lookback (trading days)</div>
-          <input id="mb_lookback" value="${DEFAULT_LOOKBACK_DAYS}" style="padding:6px 8px; border-radius:8px; border:1px solid #d0d0d0; background:#f7f7f7; color:#111111;">
-        </label>
-      </div>
+<div style="padding:12px; display:grid; gap:12px; overflow-y: auto; flex: 1;">
 
-      <div>
-        <div style="opacity:.8; margin-bottom:6px;">
-          Holdings input (one per line): <span style="opacity:.9;">TICKER, WEIGHT</span> (weight can be % or decimal)
-        </div>
-        <textarea id="mb_holdings" rows="6" style="width:100%; padding:8px; border-radius:8px; border:1px solid #d0d0d0; background:#f7f7f7; color:#111111;"
-          placeholder="AAPL, 25%
-MSFT, 25%
-VOO, 50%"></textarea>
-        <div style="margin-top:6px; opacity:.7;">
-          Tip: weights don’t need to sum to 100%; we’ll normalize them.
-        </div>
-      </div>
+  <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:8px; grid-auto-rows: min-content;">
+    <label style="display:grid; gap:4px;">
+       <div style="opacity:.8; font-size:11px;">Source</div>
+       <select id="mb_source" style="padding:5px; border-radius:6px; border:1px solid #ccc;">
+         <option value="yahoo">Yahoo</option>
+         <option value="stooq">Stooq</option>
+       </select>
+    </label>
+    <label style="display:grid; gap:4px;">
+      <div style="opacity:.8; font-size:11px;">Proxy</div>
+      <input id="mb_market" value="${DEFAULT_MARKET_YAHOO}" style="padding:6px 8px; border-radius:6px; border:1px solid #ccc;">
+    </label>
+    <label style="display:grid; gap:4px;">
+      <div style="opacity:.8; font-size:11px;">Lookback</div>
+      <input id="mb_lookback" value="${DEFAULT_LOOKBACK_DAYS}" style="padding:6px 8px; border-radius:6px; border:1px solid #ccc;">
+    </label>
+  </div>
 
-      <div style="display:flex; gap:8px; flex-wrap:wrap;">
-        <button id="mb_scrape" style="cursor:pointer; background:#f7f7f7; color:#111111; border:0 solid #d0d0d0; border-radius:8px; padding:6px 10px;">Try auto-scrape</button>
-        <button id="mb_calc" style="cursor:pointer; background:#f7f7f7; color:#111111; border:0; border-radius:8px; padding:6px 10px; font-weight:700;">Calculate beta</button>
-        <button id="mb_clear" style="cursor:pointer; background:#f7f7f7; color:#111111; border:0 solid #d0d0d0; border-radius:8px; padding:6px 10px;">Clear</button>
-      </div>
+  <div>
+    <div style="opacity:.8; margin-bottom:6px; font-size:11px;">Holdings (TICKER, WEIGHT)</div>
+    <textarea id="mb_holdings" rows="6" style="width:100%; padding:8px; border-radius:6px; border:1px solid #ccc; font-family:monospace;" placeholder="AAPL, 25%&#10;MSFT, 0.25"></textarea>
+  </div>
 
-      <div id="mb_status" style="white-space:pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace; background:#f7f7f7; border:1px solid #d0d0d0; border-radius:8px; padding:8px; min-height:70px;"></div>
+  <div>
+    <button id="mb_scrape" style="cursor:pointer; background:#eef; color:#333; border:1px solid #ccd; border-radius:6px; padding:6px 12px;flex: 1;white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">Auto-scrape & Aggregate</button>
+    <button id="mb_calc" style="cursor:pointer; background:#0055a5; color:#fff; border:none; border-radius:6px; padding:6px 12px; font-weight:600;">Calculate</button>
+    <button id="mb_clear" style="cursor:pointer; background:#fff; color:#333; border:1px solid #ccc; border-radius:6px; padding:6px 12px;">Clear</button>
+  </div>
 
-      <div id="mb_tablewrap"></div>
-    </div>
-  `;
+  <div id="mb_status" style="white-space:pre-wrap; font-family:monospace; font-size:11px; color:#444; min-height:1.2em;"></div>
+  <div id="mb_tablewrap"></div>
+</div>
+`;
     document.documentElement.appendChild(panel);
 
     const $ = (id) => panel.querySelector(id);
-
     $("#mb_close").addEventListener("click", () => panel.remove());
     $("#mb_clear").addEventListener("click", () => {
         $("#mb_holdings").value = "";
@@ -239,284 +210,239 @@ VOO, 50%"></textarea>
         $("#mb_tablewrap").innerHTML = "";
     });
 
-    // --- Auto-scrape best-effort ---
-    $("#mb_scrape").addEventListener("click", () => {
-        const scraped = scrapeHoldingsFromPage();
-        if (!scraped.length) {
-            $("#mb_status").textContent =
-                "Auto-scrape: couldn’t confidently find holdings on this page.\n" +
-                "Paste manually as: TICKER, WEIGHT (or use market value and we’ll compute weights).\n\n" +
-                "If you want, open your Holdings table view and try again.";
-            return;
-        }
-        const lines = scraped.map((h) => `${h.ticker}, ${h.weight}`).join("\n");
-        $("#mb_holdings").value = lines;
-        $("#mb_status").textContent = `Auto-scrape: found ${scraped.length} rows. Review weights/tickers before calculating.`;
+    $("#mb_source").addEventListener("change", (e) => {
+        $("#mb_market").value = (e.target.value === "stooq") ? DEFAULT_MARKET_STOOQ : DEFAULT_MARKET_YAHOO;
     });
 
-    function scrapeHoldingsFromPage() {
-        // This is intentionally conservative and generic. It tries common patterns:
-        // - a table containing the word "Symbol" or "Ticker"
-        // - and a column that looks like a weight (%), or market value to derive weights
+    // --- Draggable ---
+    const header = $("#mb_header");
+    let isDragging = false, startX, startY, initialLeft, initialTop;
+    header.addEventListener("mousedown", (e) => {
+        isDragging = true; startX = e.clientX; startY = e.clientY;
+        const rect = panel.getBoundingClientRect();
+        initialLeft = rect.left; initialTop = rect.top;
+        panel.style.left = `${initialLeft}px`; panel.style.top = `${initialTop}px`;
+        panel.style.right = "auto"; panel.style.bottom = "auto";
+        document.addEventListener("mousemove", onMouseMove);
+        document.addEventListener("mouseup", onMouseUp);
+    });
+    function onMouseMove(e) { if(isDragging) { panel.style.left = `${initialLeft + (e.clientX-startX)}px`; panel.style.top = `${initialTop + (e.clientY-startY)}px`; } }
+    function onMouseUp() { isDragging = false; document.removeEventListener("mousemove", onMouseMove); document.removeEventListener("mouseup", onMouseUp); }
+
+    // --- Aggregation Logic ---
+    $("#mb_scrape").addEventListener("click", () => {
+        const result = scrapeAndAggregate();
+        if (!result.holdings.length) {
+            $("#mb_status").textContent = "No valid holdings found in any table.";
+            return;
+        }
+        $("#mb_holdings").value = result.holdings.map(h => `${h.ticker}, ${h.weight}`).join("\n");
+        $("#mb_status").textContent = `Found ${result.tableCount} tables.\nAggregated ${result.rowCount} rows into ${result.holdings.length} unique holdings.\nTotal Value Detected: $${result.totalMV.toLocaleString(undefined, {maximumFractionDigits:0})}`;
+    });
+
+    function scrapeAndAggregate() {
         const tables = Array.from(document.querySelectorAll("table"));
-        let best = null;
+        let rawRows = [];
+        let tableCount = 0;
 
         for (const table of tables) {
+            // 1. Check if table looks like a holdings table
             const text = table.innerText || "";
             if (!/symbol|ticker/i.test(text)) continue;
 
-            const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
-                                                                               (th.innerText || "").trim()
-                                                                              );
-            const hasSymbolCol = headers.some((h) => /symbol|ticker/i.test(h));
-            if (!hasSymbolCol) continue;
+            const headers = Array.from(table.querySelectorAll("thead th, tr th")).map(th => (th.innerText || "").trim());
+
+            // Identify Columns
+            const symIdx = headers.findIndex(h => /symbol|ticker|asset/i.test(h));
+            // "Value" often appears as "Market Value", "Current Value", "Amount", etc.
+            const mvIdx = headers.findIndex(h => /market\s*value|current\s*value|value/i.test(h));
+            // Fallback: Percentage Weight
+            const wIdx = headers.findIndex(h => /weight|%|allocation/i.test(h));
+
+            if (symIdx === -1) continue; // Must have a ticker column
+            // Must have either a value or a weight column to be useful
+            if (mvIdx === -1 && wIdx === -1) continue;
 
             const rows = Array.from(table.querySelectorAll("tbody tr"));
-            if (rows.length < 2) continue;
+            if (rows.length < 1) continue;
 
-            // Find indexes
-            const symIdx = headers.findIndex((h) => /symbol|ticker/i.test(h));
-            const weightIdx = headers.findIndex((h) => /weight|%|allocation/i.test(h));
-            const mvIdx = headers.findIndex((h) => /market\s*value|value/i.test(h));
-
-            const parsed = [];
-            let totalMV = 0;
-
+            let foundInTable = 0;
             for (const tr of rows) {
                 const tds = Array.from(tr.querySelectorAll("td"));
-                if (tds.length < Math.max(symIdx, weightIdx, mvIdx) + 1) continue;
+                if (tds.length <= Math.max(symIdx, mvIdx, wIdx)) continue;
 
-                //const rawSym = (tds[symIdx]?.innerText || "").trim();
-                //if (!rawSym || rawSym.length > 12) continue; // crude sanity check
-                //const ticker = rawSym.replace(/[^A-Za-z0-9.\-]/g, "");
-                const ticker = extractTickerFromCell(tds[symIdx]);
-                if (!ticker || /[a-z0-9]/.test(ticker)) continue;
+                // Extract Ticker
+                let ticker = "";
+                const a = tds[symIdx].querySelector("a");
+                if (a) ticker = a.textContent.trim().split(" ")[0];
 
+                if (!ticker || /[a-z0-9]/.test(ticker)) continue; // skip junk/lowercase
 
-                let w = NaN;
-                if (weightIdx !== -1) {
-                    const rawW = (tds[weightIdx]?.innerText || "").trim();
+                // Extract Market Value ($)
+                let mv = 0;
+                if (mvIdx !== -1) {
+                    mv = safeNum(tds[mvIdx].innerText);
+                }
+
+                // Extract Weight (%)
+                let w = 0;
+                if (wIdx !== -1) {
+                    const rawW = tds[wIdx].innerText;
                     w = safeNum(rawW);
-                    if (Number.isFinite(w) && /%/.test(rawW)) w = w / 100;
+                    if (/%/.test(rawW)) w /= 100;
                 }
 
-                let mv = NaN;
-                if (!Number.isFinite(w) && mvIdx !== -1) {
-                    const rawMV = (tds[mvIdx]?.innerText || "").trim();
-                    mv = safeNum(rawMV);
-                    if (Number.isFinite(mv)) {
-                        totalMV += mv;
-                    }
-                }
-
-                parsed.push({ ticker, weight: w, mv });
-            }
-
-            // If weights missing but market values exist, compute weights
-            if (parsed.length && parsed.some((x) => Number.isFinite(x.mv)) && totalMV > 0) {
-                for (const p of parsed) {
-                    if (!Number.isFinite(p.weight) && Number.isFinite(p.mv)) p.weight = p.mv / totalMV;
+                // We only care if we have MV or W
+                if (mv > 0 || w > 0) {
+                    rawRows.push({ ticker, mv, w });
+                    foundInTable++;
                 }
             }
-
-            // Keep only those with a numeric weight
-            const cleaned = parsed.filter((x) => x.ticker && Number.isFinite(x.weight) && x.weight > 0);
-            if (!cleaned.length) continue;
-
-            // Pick the biggest result set
-            if (!best || cleaned.length > best.length) best = cleaned;
+            if (foundInTable > 0) tableCount++;
         }
 
-        return (best || []).map((x) => ({
-            ticker: x.ticker,
-            weight: `${(x.weight * 100).toFixed(2)}%`,
-        }));
+        // --- Aggregation Step ---
+        // Prefer Market Value for aggregation.
+        // If some rows have MV and others don't, it's messy. We will assume if MV exists, we use it.
+
+        // Map: Ticker -> Total MV
+        const tickerMap = new Map();
+        let globalMV = 0;
+
+        for (const r of rawRows) {
+            if (r.mv > 0) {
+                const cur = tickerMap.get(r.ticker) || 0;
+                tickerMap.set(r.ticker, cur + r.mv);
+                globalMV += r.mv;
+            }
+        }
+
+        // If we found valid dollar values, use them to build weights
+        if (globalMV > 0) {
+            const uniqueHoldings = [];
+            for (const [ticker, totalMV] of tickerMap.entries()) {
+                uniqueHoldings.push({ ticker, weight: (totalMV / globalMV).toFixed(5) }); // 5 decimals for precision
+            }
+            return { tableCount, rowCount: rawRows.length, holdings: uniqueHoldings, totalMV: globalMV };
+        }
+
+        // Fallback: If no dollar values found (only %), we can't mathematically sum them accurately
+        // without knowing the account size.
+        // Best Effort: Just average the weights or sum them (assuming they belong to the same pot).
+        // Here we will just List them all and let the user decide.
+        // But likely we won't hit this on Merrill, as MV is standard.
+        return {
+            tableCount,
+            rowCount: rawRows.length,
+            holdings: rawRows.map(r => ({ ticker: r.ticker, weight: r.w || 0.01 })), // default dummy weight
+            totalMV: 0
+        };
     }
 
-    // --- Main calculation ---
+    // --- Calculation & Render (Same as before) ---
     $("#mb_calc").addEventListener("click", async () => {
-        $("#mb_status").textContent = "Working…";
+        const source = $("#mb_source").value;
+        const marketSymRaw = $("#mb_market").value;
+        const marketSym = normalizeTicker(marketSymRaw, source);
+        const lookback = parseInt($("#mb_lookback").value) || DEFAULT_LOOKBACK_DAYS;
+
+        $("#mb_status").textContent = `Preparing (${source.toUpperCase()})...`;
         $("#mb_tablewrap").innerHTML = "";
 
         try {
-            const marketSym = normalizeToStooqSymbol($("#mb_market").value) || DEFAULT_MARKET;
-            const lookback = Math.max(60, Math.min(1500, Math.floor(safeNum($("#mb_lookback").value) || DEFAULT_LOOKBACK_DAYS)));
+            const lines = $("#mb_holdings").value.split("\n").filter(x => x.trim());
+            const holdings = [];
+            lines.forEach(line => {
+                const [t, wRaw] = line.split(",").map(s => s.trim());
+                let w = safeNum(wRaw);
+                if (/%/.test(wRaw)) w /= 100;
+                if (t && w > 0) holdings.push({ ticker: t, weight: w });
+            });
 
-            const holdings = parseHoldings($("#mb_holdings").value);
-            if (!holdings.length) {
-                $("#mb_status").textContent =
-                    "No holdings parsed.\nEnter lines like:\nAAPL, 25%\nMSFT, 0.25\nVOO, 50%";
-                return;
-            }
-
-            // Normalize weights to sum to 1
+            if (!holdings.length) throw new Error("No holdings.");
             const wSum = holdings.reduce((s, h) => s + h.weight, 0);
-            if (!(wSum > 0)) throw new Error("Weights sum to 0.");
-            holdings.forEach((h) => (h.weight = h.weight / wSum));
+            holdings.forEach(h => h.weight /= wSum);
 
-            $("#mb_status").textContent =
-                `Fetching market (${marketSym}) + ${holdings.length} holdings from Stooq…\n` +
-                `Lookback: ${lookback} trading days\n`;
-
-            const marketPrices = await fetchPrices(marketSym);
-            const marketSlice = marketPrices.slice(- (lookback + 5)); // +5 cushion for return calc
-            const marketRets = toReturns(marketSlice);
+            const needsMarket = holdings.some(h => !getCachedBeta(source, normalizeTicker(h.ticker, source), marketSym, lookback));
+            let marketRets = null;
+            if (needsMarket) {
+                $("#mb_status").textContent = `Fetching Market: ${marketSym}`;
+                const mPrices = source === "stooq" ? await fetchPricesStooq(marketSym) : await fetchPricesYahoo(marketSym);
+                marketRets = toReturns(mPrices.slice(-(lookback + 10)));
+            }
 
             const results = [];
+            let i = 0;
             for (const h of holdings) {
-                const sym = normalizeToStooqSymbol(h.ticker);
-                if (!sym) continue;
+                i++;
+                const sym = normalizeTicker(h.ticker, source);
+                const cached = getCachedBeta(source, sym, marketSym, lookback);
+                if (cached) { results.push({ ...h, beta: cached.beta, n: cached.n, cached: true }); continue; }
 
-                $("#mb_status").textContent += `• ${h.ticker} → ${sym}\n`;
-
-                const assetPrices = await fetchPrices(sym);
-                const assetSlice = assetPrices.slice(- (lookback + 5));
-                const assetRets = toReturns(assetSlice);
-
-                const aligned = alignReturns(assetRets, marketRets);
-                const beta = betaFromReturns(aligned.asset, aligned.mkt);
-
-                results.push({
-                    ticker: h.ticker,
-                    stooq: sym,
-                    weight: h.weight,
-                    beta,
-                    n: Math.min(aligned.asset.length, aligned.mkt.length),
-                });
+                $("#mb_status").textContent = `Fetching ${i}/${holdings.length}: ${sym}`;
+                try {
+                    if (i > 1) await sleep(1000);
+                    const prices = source === "stooq" ? await fetchPricesStooq(sym) : await fetchPricesYahoo(sym);
+                    const assetRets = toReturns(prices.slice(-(lookback + 10)));
+                    const { asset, mkt } = alignReturns(assetRets, marketRets);
+                    const beta = calculateBeta(asset, mkt);
+                    if (!isNaN(beta)) setCachedBeta(source, sym, marketSym, lookback, beta, asset.length);
+                    results.push({ ...h, beta, n: asset.length, cached: false });
+                } catch (e) {
+                    results.push({ ...h, beta: NaN, n: 0, error: true });
+                }
             }
-
-            // Portfolio beta
-            const portfolioBeta = results.reduce((s, r) => {
-                const b = Number.isFinite(r.beta) ? r.beta : 0;
-                return s + r.weight * b;
-            }, 0);
-
-            renderResults(results, portfolioBeta, marketSym);
-        } catch (err) {
-            $("#mb_status").textContent = `Error: ${err?.message || String(err)}`;
-        }
+            renderTable(results);
+            $("#mb_status").textContent = `Done. Source: ${source}`;
+        } catch (e) { $("#mb_status").textContent = `Error: ${e.message}`; }
     });
 
-    function parseHoldings(text) {
-        // Lines: TICKER, WEIGHT
-        // WEIGHT: "25%" or "0.25" or "$1234" (not supported here)
-        const lines = (text || "")
-        .split(/\r?\n/)
-        .map((l) => l.trim())
-        .filter(Boolean);
-
-        const out = [];
-        for (const line of lines) {
-            const parts = line.split(",").map((p) => p.trim());
-            if (parts.length < 2) continue;
-            const ticker = parts[0];
-            const rawW = parts[1];
-            let w = safeNum(rawW);
-            if (!Number.isFinite(w)) continue;
-            if (/%/.test(rawW)) w = w / 100;
-            if (!(w > 0)) continue;
-            out.push({ ticker, weight: w });
-        }
-        return out;
-    }
-
-    function extractTickerFromCell(td) {
-        if (!td) return "";
-
-        // 1) If there is a link, it's usually the real ticker
-        const a = td.querySelector("a");
-        if (a && a.textContent) {
-            return a.textContent.trim().split(" ")[0];
-        }
-
-        // 2) Otherwise, take only the first text node (before popup/tooltip text)
-        for (const node of td.childNodes) {
-            if (node.nodeType === Node.TEXT_NODE) {
-                const t = node.textContent;
-                if (t) return t;
-            }
-        }
-
-        // 3) Fallback: regex extract ticker-like token
-        const txt = (td.textContent || "").trim();
-        const m = txt.match(/[A-Z]{1,5}(?:\.[A-Z])?/);
-        return m ? m[0] : "";
-    }
-
-    async function fetchPrices(symbol) {
-        const url = STOOQ_DAILY_URL(symbol);
-        const txt = await gmFetchText(url);
-        const rows = parseStooqCsv(txt);
-        if (!rows.length) {
-            throw new Error(`No price data from Stooq for ${symbol}. Check symbol format (e.g., aapl.us).`);
-        }
-        await sleep(1000);
-        return rows;
-    }
-
-    function renderResults(results, portfolioBeta, marketSym) {
-        const bad = results.filter((r) => !Number.isFinite(r.beta) || r.n < 60);
-        const good = results.filter((r) => Number.isFinite(r.beta) && r.n >= 60);
-
-        const lines = [];
-        lines.push(`Done.`);
-        lines.push(`Market proxy: ${marketSym}`);
-        lines.push(`Portfolio beta ≈ ${Number.isFinite(portfolioBeta) ? portfolioBeta.toFixed(3) : "NaN"}`);
-        if (bad.length) {
-            lines.push("");
-            lines.push(`Warnings (${bad.length}): some betas may be unreliable (missing data or short overlap).`);
-        }
-        $("#mb_status").textContent = lines.join("\n");
-
+    function renderTable(results) {
+        results.sort((a, b) => b.weight - a.weight);
         const table = document.createElement("table");
-        table.style.cssText = "width:100%; border-collapse:collapse; margin-top:8px; font-family: ui-monospace, Menlo, Consolas, monospace;";
+        table.style.cssText = "width:100%; border-collapse:collapse; margin-top:8px; font-size:12px;";
         table.innerHTML = `
-      <thead>
-        <tr>
-          <th style="text-align:left; padding:6px; border-bottom:1px solid #333;">Ticker</th>
-          <th style="text-align:right; padding:6px; border-bottom:1px solid #333;">Weight</th>
-          <th style="text-align:right; padding:6px; border-bottom:1px solid #333;">Beta</th>
-          <th style="text-align:right; padding:6px; border-bottom:1px solid #333;">w×β</th>
-          <th style="text-align:right; padding:6px; border-bottom:1px solid #333;">N</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-      <tfoot>
-        <tr>
-          <td style="padding:6px; border-top:1px solid #333; font-weight:700;">Portfolio</td>
-          <td style="padding:6px; border-top:1px solid #333;"></td>
-          <td style="padding:6px; border-top:1px solid #333; text-align:right; font-weight:700;">${Number.isFinite(portfolioBeta) ? portfolioBeta.toFixed(3) : "NaN"}</td>
-          <td style="padding:6px; border-top:1px solid #333;"></td>
-          <td style="padding:6px; border-top:1px solid #333;"></td>
-        </tr>
-      </tfoot>
-    `;
+  <thead>
+    <tr style="background:#f4f4f4; border-bottom:1px solid #ddd;">
+      <th style="text-align:left; padding:6px;">Ticker</th>
+      <th style="text-align:right; padding:6px;">Weight</th>
+      <th style="text-align:right; padding:6px;">Beta ✎</th>
+      <th style="text-align:right; padding:6px;">w×β</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+  <tfoot>
+    <tr style="border-top:2px solid #ccc; font-weight:700; background:#fafafa;">
+      <td style="padding:8px;">Portfolio</td>
+      <td style="padding:8px;">100%</td>
+      <td style="padding:8px;"></td>
+      <td style="padding:8px; text-align:right;" id="mb_total"></td>
+    </tr>
+  </tfoot>`;
 
-        const tbody = table.querySelector("tbody");
-        for (const r of results.sort((a, b) => b.weight - a.weight)) {
-            const wb = (Number.isFinite(r.beta) ? r.weight * r.beta : NaN);
-            const tr = document.createElement("tr");
-            tr.innerHTML = `
-        <td style="padding:6px; border-bottom:1px solid #222;">${escapeHtml(r.ticker)}</td>
-        <td style="padding:6px; border-bottom:1px solid #222; text-align:right;">${(r.weight * 100).toFixed(2)}%</td>
-        <td style="padding:6px; border-bottom:1px solid #222; text-align:right;">${Number.isFinite(r.beta) ? r.beta.toFixed(3) : "—"}</td>
-        <td style="padding:6px; border-bottom:1px solid #222; text-align:right;">${Number.isFinite(wb) ? wb.toFixed(3) : "—"}</td>
-        <td style="padding:6px; border-bottom:1px solid #222; text-align:right;">${r.n}</td>
-      `;
-          if (!Number.isFinite(r.beta) || r.n < 60) tr.style.opacity = "0.65";
-          tbody.appendChild(tr);
-      }
+    const tbody = table.querySelector("tbody");
+    results.forEach(r => {
+        const tr = document.createElement("tr");
+        tr.style.borderBottom = "1px solid #eee";
+        tr.innerHTML = `
+    <td style="padding:6px;"><b>${r.ticker}</b> <span style="font-size:9px; color:#999;">${r.cached ? 'cached' : ''}</span></td>
+    <td style="padding:6px; text-align:right;" data-w="${r.weight}">${(r.weight*100).toFixed(1)}%</td>
+    <td style="padding:6px; text-align:right;"><input type="number" step="0.01" class="b-in" value="${isNaN(r.beta)?'':r.beta.toFixed(2)}" style="width:50px; text-align:right;"></td>
+    <td style="padding:6px; text-align:right;" class="wb-out">—</td>`;
+      tbody.appendChild(tr);
+  });
+    $("#mb_tablewrap").innerHTML = ""; $("#mb_tablewrap").appendChild(table);
 
-        $("#mb_tablewrap").innerHTML = "";
-        $("#mb_tablewrap").appendChild(table);
-
-        function escapeHtml(s) {
-            return String(s)
-                .replaceAll("&", "&amp;")
-                .replaceAll("<", "&lt;")
-                .replaceAll(">", "&gt;")
-                .replaceAll('"', "&quot;")
-                .replaceAll("'", "&#039;");
-        }
-    }
+    const recalc = () => {
+        let sum = 0, wTotal = 0;
+        tbody.querySelectorAll("tr").forEach(tr => {
+            const w = parseFloat(tr.querySelector("td[data-w]").dataset.w);
+            const b = parseFloat(tr.querySelector(".b-in").value);
+            if (!isNaN(b)) { sum += w * b; wTotal += w; tr.querySelector(".wb-out").textContent = (w*b).toFixed(3); }
+            else tr.querySelector(".wb-out").textContent = "—";
+        });
+        $("#mb_total").textContent = wTotal > 0 ? sum.toFixed(3) : "—";
+    };
+    tbody.addEventListener("input", recalc); recalc();
+}
 })();
